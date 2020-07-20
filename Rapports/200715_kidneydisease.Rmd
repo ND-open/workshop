@@ -1,0 +1,158 @@
+---
+title: "Detection de l'insuffisance chronique rénale"
+author: "Camille Bonamy"
+date: "20/07/2020"
+output: md_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Context
+
+Ce morceau code vient de l'excellent blog du Dr Shirin Glanders ( https://shirinsplayground.netlify.app/2017/12/lime_sketchnotes/ ). L'objectif est de modéliser et extraire une interprétation individuelle des prévisions de déficience chronique des reins.
+
+## Charger les librairies et les données
+
+```{r library, message=FALSE, warning=FALSE}
+library(tidyverse)  # for tidy data analysis
+library(farff)      # for reading arff file
+library(missForest) # for imputing missing values
+library(dummies)    # for creating dummy variables
+library(caret)      # for modeling
+library(lime)       # for explaining predictions
+
+library(dplyr)       # pour manipuler les objets
+```
+
+Il faut au choix cloner le projet avec les données correspondantes ou copier le code et télécharger les données en "http://archive.ics.uci.edu/ml/datasets/Chronic_Kidney_Disease".
+
+```{r data load, error=FALSE}
+data_file <- here::here("data", "Chronic_Kidney_Disease_full.arff")
+data <- farff::readARFF(data_file)
+```
+
+
+## Vérification de la qualitées des données, imputation
+
+```{r data miss viz}
+data %>%
+        visdat::vis_miss()
+```
+
+Application d'une statégie de complétion des valeurs manquantes via `missForest::missForest`. D'autres alternatives existes (e.g avec le package `missMDA`).
+
+```{r data imputation}
+data_imp <- missForest(data)
+
+data_imp_final <- data_imp$ximp
+```
+
+
+## Création de la matrice d'apprentissage, normalisation (ici 0-1)
+
+```{r data dummies and scaling}
+data_dummy <- dummies::dummy.data.frame(dplyr::select(data_imp_final, -class), sep = "_")
+data <- cbind(dplyr::select(data_imp_final, class),
+              scale(data_dummy,
+                    center = apply(data_dummy, 2, min),
+                    scale = apply(data_dummy, 2, max)
+                    )
+              )
+```
+
+
+## Echantillon apprentissage / test
+
+```{r train test split}
+# training and test set
+set.seed(42)
+index <- createDataPartition(data$class, p = 0.9, list = FALSE)
+train_data <- data[index, ]
+test_data  <- data[-index, ]
+
+# saveRDS(object = train_data, file = here::here("data", "train_shirin.rds"))
+# saveRDS(object = test_data, file = here::here("data", "test_shirin.rds"))
+```
+
+
+## Entraînement
+
+```{r model trainning}
+# modeling
+model_rf <- caret::train(class ~ .,
+                         data = train_data,
+                         method = "rf", # random forest
+                         trControl = trainControl(method = "repeatedcv",
+                                                  number = 10,
+                                                  repeats = 5,
+                                                  verboseIter = FALSE))
+
+model_rf
+```
+
+
+## Interprétation globale
+
+```{r global interpret}
+caret::varImp(model_rf)
+caret::dotPlot(caret::varImp(model_rf))
+# save the model for plumber app
+# saveRDS(model_rf, here::here("model_rf_shirin.rds"))
+```
+
+
+## Evaluation
+
+```{r model evaluation on test}
+# predictions
+pred <- data.frame(sample_id = 1:nrow(test_data), predict(model_rf, test_data, type = "prob"), actual = test_data$class) %>%
+        mutate(prediction = colnames(.)[2:3][apply(.[, 2:3], 1, which.max)], correct = ifelse(actual == prediction, "correct", "wrong"))
+
+confusionMatrix(pred$actual, factor(pred$prediction) )
+```
+
+
+## Interprétation locale
+
+```{r model local interpretation, warning=FALSE, message=FALSE, fig.height = 10, fig.width = 10}
+train_x <- dplyr::select(train_data, -class)
+test_x <- dplyr::select(test_data, -class)
+
+train_y <- dplyr::select(train_data, class)
+test_y <- dplyr::select(test_data, class)
+
+explainer <- lime(train_x, model_rf, n_bins = 5, quantile_bins = TRUE)
+
+explanation_df <- lime::explain(test_x, explainer, 
+                                n_labels = 1, n_features = 8, 
+                                n_permutations = 1000, 
+                                feature_select = "forward_selection",
+                                
+                                )
+
+explanation_df %>%
+        ggplot(aes(x = model_r2, fill = label)) +
+        geom_density(alpha = 0.5)
+
+explanation_df %>%
+        # glimpse()
+        # filter(case == unique(case)[1:10])
+        filter(label == "notckd") %>%
+        arrange(desc(model_r2)) %>%
+        # view()
+        # count(case)
+        filter(case %in% c("258", "313", "319")) %>%
+        plot_features(. , ncol = 1)
+```
+
+
+## Pour aller plus loin
+
+* interpreter l'influence par variables avec `randomForest::partialPlot()
+* utiliser d'autres modèles
+* analyser les cas mal prédits / bien prédits (lift curve, ...)
+* tester `iml` : https://github.com/christophM/iml
